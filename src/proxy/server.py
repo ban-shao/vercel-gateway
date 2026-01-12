@@ -60,10 +60,14 @@ class KeyManager:
         self.load_keys()
     
     def load_keys(self) -> list[str]:
-        """从文件加载密钥"""
+        """从文件加载密钥，优先使用高余额密钥"""
+        # 按优先级排列：高余额 > 中高余额 > 中余额 > 有效密钥 > 全部密钥
         key_files = [
-            BASE_DIR / "data/keys/active_keys.txt",
-            BASE_DIR / "data/keys/total_keys.txt"
+            BASE_DIR / "data/keys/keys_high.txt",          # $3+ 高余额（优先）
+            BASE_DIR / "data/keys/keys_medium_high.txt",   # $2-3 中高余额
+            BASE_DIR / "data/keys/keys_medium.txt",        # $1-2 中余额
+            BASE_DIR / "data/keys/active_keys.txt",        # 所有有效密钥
+            BASE_DIR / "data/keys/total_keys.txt"          # 全部密钥
         ]
         
         for key_file in key_files:
