@@ -11,13 +11,13 @@ import time
 import json
 import asyncio
 from pathlib import Path
-from typing import Optional
+from typing import Optional, AsyncGenerator
 from datetime import datetime
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
@@ -44,7 +44,7 @@ TARGET_BASE = f"https://{TARGET_HOST}"
 def log(level: str, message: str):
     """简单日志输出"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] [{level.upper()}] {message}")
+    print(f"[{timestamp}] [{level.upper()}] {message}", flush=True)
 
 
 # ================================
@@ -61,19 +61,17 @@ class KeyManager:
     
     def load_keys(self) -> list[str]:
         """从文件加载密钥，优先使用高余额密钥"""
-        # 按优先级排列：高余额 > 中高余额 > 中余额 > 有效密钥 > 全部密钥
         key_files = [
-            BASE_DIR / "data/keys/keys_high.txt",          # $3+ 高余额（优先）
-            BASE_DIR / "data/keys/keys_medium_high.txt",   # $2-3 中高余额
-            BASE_DIR / "data/keys/keys_medium.txt",        # $1-2 中余额
-            BASE_DIR / "data/keys/active_keys.txt",        # 所有有效密钥
-            BASE_DIR / "data/keys/total_keys.txt"          # 全部密钥
+            BASE_DIR / "data/keys/keys_high.txt",
+            BASE_DIR / "data/keys/keys_medium_high.txt",
+            BASE_DIR / "data/keys/keys_medium.txt",
+            BASE_DIR / "data/keys/active_keys.txt",
+            BASE_DIR / "data/keys/total_keys.txt"
         ]
         
         for key_file in key_files:
             if key_file.exists():
                 content = key_file.read_text()
-                # 支持逗号分隔或换行分隔
                 keys = [k.strip() for k in re.split(r'[,\n]', content) if k.strip()]
                 if keys:
                     self.keys = keys
@@ -112,13 +110,11 @@ class KeyManager:
             now = time.time()
             start_index = self.current_index
             
-            # 尝试找一个可用的密钥
             for i in range(len(self.keys)):
                 index = (start_index + i) % len(self.keys)
                 key = self.keys[index]
                 state = self.get_key_state(key)
                 
-                # 检查是否已过冷却期
                 if state["disabled"] and now >= state["disabled_until"]:
                     state["disabled"] = False
                     log("info", f"密钥 {key[:8]}... 冷却结束，已恢复")
@@ -128,7 +124,6 @@ class KeyManager:
                     state["last_used"] = now
                     return key
             
-            # 所有密钥都不可用，返回冷却时间最短的
             best_key = self.keys[0]
             min_wait = float('inf')
             for key in self.keys:
@@ -208,6 +203,9 @@ class KeyManager:
 # 全局密钥管理器
 key_manager = KeyManager()
 
+# 全局 HTTP 客户端
+http_client: Optional[httpx.AsyncClient] = None
+
 # ================================
 # 辅助函数
 # ================================
@@ -250,8 +248,10 @@ def check_auth(request: Request) -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
+    global http_client
+    
     log("info", "=" * 60)
-    log("info", "Vercel Gateway Proxy - v2.0.0 (Python/FastAPI)")
+    log("info", "Vercel Gateway Proxy - v2.1.0 (Python/FastAPI)")
     log("info", "=" * 60)
     log("info", f"监听端口: {PROXY_PORT}")
     log("info", f"已加载密钥: {len(key_manager.keys)} 个")
@@ -262,10 +262,13 @@ async def lifespan(app: FastAPI):
     if not key_manager.keys:
         log("warn", "警告: 未加载任何密钥！请检查 data/keys/ 目录")
     
+    # 创建全局 HTTP 客户端
+    http_client = httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=30.0))
+    
     # 启动定时重载密钥任务
     async def reload_task():
         while True:
-            await asyncio.sleep(300)  # 每5分钟
+            await asyncio.sleep(300)
             key_manager.reload_keys()
     
     task = asyncio.create_task(reload_task())
@@ -273,13 +276,14 @@ async def lifespan(app: FastAPI):
     yield
     
     task.cancel()
+    await http_client.aclose()
     log("info", "服务已停止")
 
 
 app = FastAPI(
     title="Vercel Gateway Proxy",
     description="Vercel AI Gateway 密钥池代理服务",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan
 )
 
@@ -305,7 +309,7 @@ async def health():
     return {
         "ok": True,
         "service": "Vercel Gateway Proxy",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "keys": {
             "total": status["total"],
             "available": status["available"]
@@ -355,6 +359,42 @@ async def admin_reload(request: Request):
 
 
 # ================================
+# 流式响应生成器
+# ================================
+
+async def stream_response(
+    method: str,
+    url: str,
+    headers: dict,
+    content: bytes,
+    gateway_key: str
+) -> AsyncGenerator[bytes, None]:
+    """流式响应生成器 - 保持连接直到完成"""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=30.0)) as client:
+        async with client.stream(method, url, headers=headers, content=content) as response:
+            if response.status_code != 200:
+                # 读取错误响应
+                error_body = await response.aread()
+                error_text = error_body.decode('utf-8', errors='ignore')
+                
+                if is_quota_error(response.status_code, error_text):
+                    log("warn", f"流式响应检测到额度错误: {error_text[:200]}")
+                    key_manager.mark_exhausted(gateway_key)
+                
+                # 返回错误信息
+                yield f"data: {json.dumps({'error': {'message': error_text, 'code': response.status_code}})}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+                return
+            
+            # 标记成功
+            key_manager.mark_success(gateway_key)
+            
+            # 流式传输响应
+            async for chunk in response.aiter_bytes():
+                yield chunk
+
+
+# ================================
 # 路由 - 代理
 # ================================
 
@@ -364,8 +404,8 @@ async def proxy(request: Request, path: str):
     
     # 处理 CORS 预检请求
     if request.method == "OPTIONS":
-        return JSONResponse(
-            content={},
+        return Response(
+            content="",
             headers={
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "*",
@@ -390,6 +430,7 @@ async def proxy(request: Request, path: str):
     # 读取请求体
     body = await request.body()
     body_json = None
+    is_stream = False
     
     if body:
         try:
@@ -400,6 +441,8 @@ async def proxy(request: Request, path: str):
                 body_json["model"] = normalize_model(original_model)
                 if original_model != body_json["model"]:
                     log("info", f"模型标准化: {original_model} -> {body_json['model']}")
+            # 检查是否为流式请求
+            is_stream = body_json.get("stream", False)
         except json.JSONDecodeError:
             pass
     
@@ -434,92 +477,68 @@ async def proxy(request: Request, path: str):
             if key in request.headers:
                 headers[key] = request.headers[key]
         
+        # 准备请求内容
+        request_content = json.dumps(body_json).encode() if body_json else body
+        
         try:
-            async with httpx.AsyncClient(timeout=180.0) as client:
-                # 判断是否为流式请求
-                is_stream = body_json and body_json.get("stream", False)
+            if is_stream:
+                # 流式请求 - 使用生成器
+                return StreamingResponse(
+                    stream_response(
+                        method=request.method,
+                        url=target_url,
+                        headers=headers,
+                        content=request_content,
+                        gateway_key=gateway_key
+                    ),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "Access-Control-Allow-Origin": "*",
+                        "X-Accel-Buffering": "no",
+                    }
+                )
+            else:
+                # 非流式请求
+                response = await http_client.request(
+                    method=request.method,
+                    url=target_url,
+                    headers=headers,
+                    content=request_content,
+                )
                 
-                if is_stream:
-                    # 流式请求
-                    async with client.stream(
-                        method=request.method,
-                        url=target_url,
-                        headers=headers,
-                        content=json.dumps(body_json) if body_json else body,
-                    ) as response:
-                        # 检查响应状态
-                        if response.status_code != 200:
-                            response_body = await response.aread()
-                            body_text = response_body.decode()
-                            
-                            if is_quota_error(response.status_code, body_text):
-                                log("warn", f"检测到额度错误: {body_text[:200]}")
-                                key_manager.mark_exhausted(gateway_key)
-                                continue
-                            
-                            return JSONResponse(
-                                status_code=response.status_code,
-                                content=json.loads(body_text) if body_text else {"error": "Unknown error"}
-                            )
-                        
-                        # 成功，流式返回
-                        key_manager.mark_success(gateway_key)
-                        
-                        async def stream_generator():
-                            async for chunk in response.aiter_bytes():
-                                yield chunk
-                        
-                        return StreamingResponse(
-                            stream_generator(),
-                            status_code=200,
-                            media_type="text/event-stream",
-                            headers={
-                                "Cache-Control": "no-cache",
-                                "Connection": "keep-alive",
-                                "Access-Control-Allow-Origin": "*",
-                                "X-Accel-Buffering": "no",
-                            }
-                        )
-                else:
-                    # 非流式请求
-                    response = await client.request(
-                        method=request.method,
-                        url=target_url,
-                        headers=headers,
-                        content=json.dumps(body_json) if body_json else body,
+                response_body = response.text
+                
+                # 检查额度错误
+                if is_quota_error(response.status_code, response_body):
+                    log("warn", f"检测到额度错误: {response_body[:200]}")
+                    key_manager.mark_exhausted(gateway_key)
+                    continue
+                
+                # 成功
+                if response.status_code == 200:
+                    key_manager.mark_success(gateway_key)
+                
+                # 构建响应头
+                response_headers = {
+                    "Access-Control-Allow-Origin": "*",
+                    "Content-Type": response.headers.get("Content-Type", "application/json"),
+                }
+                
+                try:
+                    return JSONResponse(
+                        status_code=response.status_code,
+                        content=json.loads(response_body),
+                        headers=response_headers
+                    )
+                except json.JSONDecodeError:
+                    return Response(
+                        status_code=response.status_code,
+                        content=response_body,
+                        headers=response_headers
                     )
                     
-                    response_body = response.text
-                    
-                    # 检查额度错误
-                    if is_quota_error(response.status_code, response_body):
-                        log("warn", f"检测到额度错误: {response_body[:200]}")
-                        key_manager.mark_exhausted(gateway_key)
-                        continue
-                    
-                    # 成功
-                    if response.status_code == 200:
-                        key_manager.mark_success(gateway_key)
-                    
-                    # 构建响应头
-                    response_headers = {
-                        "Access-Control-Allow-Origin": "*",
-                        "Content-Type": response.headers.get("Content-Type", "application/json"),
-                    }
-                    
-                    try:
-                        return JSONResponse(
-                            status_code=response.status_code,
-                            content=json.loads(response_body),
-                            headers=response_headers
-                        )
-                    except json.JSONDecodeError:
-                        return JSONResponse(
-                            status_code=response.status_code,
-                            content={"raw": response_body},
-                            headers=response_headers
-                        )
-                        
         except httpx.TimeoutException:
             log("error", f"请求超时，密钥: {gateway_key[:8]}...")
             key_manager.mark_exhausted(gateway_key)
