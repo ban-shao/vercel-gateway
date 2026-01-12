@@ -1,0 +1,3 @@
+# 密钥目录
+# total_keys.txt - 存放所有 API 密钥（每行一个）
+# active_keys.txt - 余额检查后自动生成的有效密钥
