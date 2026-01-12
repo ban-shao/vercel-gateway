@@ -90,38 +90,49 @@ Environment="PYTHONPATH=$INSTALL_DIR"
 WantedBy=multi-user.target
 EOF
 
-# 刷新服务
-cat > /etc/systemd/system/vercel-refresh.service << EOF
+# 每日定时任务服务（完整流程：刷新 -> 检查 -> 热加载）
+cat > /etc/systemd/system/vercel-daily.service << EOF
 [Unit]
-Description=Vercel Key Refresh Service
+Description=Vercel Gateway Daily Task (Refresh + Check + Reload)
 
 [Service]
 Type=oneshot
 User=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
-ExecStart=/usr/bin/python3 $INSTALL_DIR/src/refresher/key_refresher.py
+ExecStart=/usr/bin/python3 $INSTALL_DIR/src/daily_task.py
 Environment="PYTHONPATH=$INSTALL_DIR"
+# 超时设置：最多运行 2 小时
+TimeoutStartSec=7200
 EOF
 
-# 定时器（每天凌晨 2 点）
-cat > /etc/systemd/system/vercel-refresh.timer << EOF
+# 定时器（每天凌晨 0 点执行）
+cat > /etc/systemd/system/vercel-daily.timer << EOF
 [Unit]
-Description=Daily Vercel Key Refresh
+Description=Daily Vercel Gateway Task (Refresh + Check)
 
 [Timer]
-OnCalendar=*-*-* 02:00:00
+# 每天凌晨 00:00 执行
+OnCalendar=*-*-* 00:00:00
+# 如果错过了执行时间（如服务器关机），开机后立即补执行
 Persistent=true
+# 随机延迟 0-5 分钟，避免并发
+RandomizedDelaySec=300
 
 [Install]
 WantedBy=timers.target
 EOF
 
+# 删除旧的服务文件（如果存在）
+rm -f /etc/systemd/system/vercel-refresh.service
+rm -f /etc/systemd/system/vercel-refresh.timer
+
 # 重载 systemd
 systemctl daemon-reload
 systemctl enable vercel-proxy
-systemctl enable vercel-refresh.timer
+systemctl enable vercel-daily.timer
 
 echo -e "${GREEN}✓ systemd 服务已配置${NC}"
+echo -e "${YELLOW}  每日定时任务: 凌晨 00:00 自动执行${NC}"
 
 # 6. 创建快捷脚本
 echo -e "\n${YELLOW}[6/6] 创建管理脚本...${NC}"
@@ -131,9 +142,12 @@ cat > $INSTALL_DIR/scripts/start.sh << 'EOF'
 #!/bin/bash
 echo "启动 Vercel Gateway..."
 sudo systemctl start vercel-proxy
-sudo systemctl start vercel-refresh.timer
+sudo systemctl start vercel-daily.timer
 sleep 2
 sudo systemctl status vercel-proxy --no-pager -l
+echo ""
+echo "定时任务状态:"
+sudo systemctl status vercel-daily.timer --no-pager
 EOF
 
 # stop.sh
@@ -160,22 +174,27 @@ echo "=========================================="
 echo "   Vercel Gateway 状态"
 echo "=========================================="
 echo ""
-echo "服务状态:"
+echo "📡 服务状态:"
 systemctl is-active vercel-proxy &>/dev/null && echo "  代理服务: ✅ 运行中" || echo "  代理服务: ❌ 未运行"
-systemctl is-active vercel-refresh.timer &>/dev/null && echo "  定时刷新: ✅ 已启用" || echo "  定时刷新: ❌ 未启用"
+systemctl is-active vercel-daily.timer &>/dev/null && echo "  每日任务: ✅ 已启用" || echo "  每日任务: ❌ 未启用"
 echo ""
-echo "密钥统计:"
+echo "⏰ 下次定时任务执行时间:"
+systemctl list-timers vercel-daily.timer --no-pager 2>/dev/null | grep vercel || echo "  未设置"
+echo ""
+echo "🔑 密钥统计:"
 TOTAL=$(wc -l < /opt/vercel-gateway/data/keys/total_keys.txt 2>/dev/null || echo "0")
 ACTIVE=$(wc -l < /opt/vercel-gateway/data/keys/active_keys.txt 2>/dev/null || echo "0")
+HIGH=$(wc -l < /opt/vercel-gateway/data/keys/keys_high.txt 2>/dev/null || echo "0")
 echo "  总密钥数: $TOTAL"
 echo "  有效密钥: $ACTIVE"
+echo "  高余额($3+): $HIGH"
 echo ""
-echo "端口监听:"
+echo "🌐 端口监听:"
 ss -tlnp | grep 3001 || echo "  端口 3001 未监听"
 echo ""
-echo "最近日志 (最后5行):"
+echo "📋 最近日志 (最后5行):"
 echo "----------------------------------------"
-tail -5 /opt/vercel-gateway/logs/proxy.log 2>/dev/null || journalctl -u vercel-proxy -n 5 --no-pager 2>/dev/null || echo "  无日志"
+tail -5 /opt/vercel-gateway/logs/daily_task.log 2>/dev/null || journalctl -u vercel-proxy -n 5 --no-pager 2>/dev/null || echo "  无日志"
 echo "=========================================="
 EOF
 
@@ -193,11 +212,27 @@ cd /opt/vercel-gateway
 python3 -m src.refresher.key_refresher
 EOF
 
+# daily.sh (手动执行每日任务 - 完整流程)
+cat > $INSTALL_DIR/scripts/daily.sh << 'EOF'
+#!/bin/bash
+echo "手动执行每日任务（刷新 + 检查 + 热加载）..."
+cd /opt/vercel-gateway
+python3 -m src.daily_task
+EOF
+
 # logs.sh (查看日志)
 cat > $INSTALL_DIR/scripts/logs.sh << 'EOF'
 #!/bin/bash
 echo "查看代理服务日志 (Ctrl+C 退出)..."
 journalctl -u vercel-proxy -f
+EOF
+
+# daily-logs.sh (查看每日任务日志)
+cat > $INSTALL_DIR/scripts/daily-logs.sh << 'EOF'
+#!/bin/bash
+echo "查看每日任务日志..."
+echo "=========================================="
+tail -100 /opt/vercel-gateway/logs/daily_task.log
 EOF
 
 chmod +x $INSTALL_DIR/scripts/*.sh
@@ -223,6 +258,11 @@ echo -e "  代理端口: ${GREEN}3001${NC}"
 echo -e "  AUTH_KEY: ${GREEN}$AUTH_KEY${NC}"
 echo ""
 
+echo -e "${YELLOW}每日定时任务:${NC}"
+echo -e "  执行时间: ${GREEN}每天凌晨 00:00${NC}"
+echo -e "  任务内容: ${GREEN}刷新所有密钥 → 检查余额 → 更新高余额列表 → 热加载代理${NC}"
+echo ""
+
 echo -e "${YELLOW}下一步:${NC}"
 echo -e "  1. 添加密钥: ${GREEN}nano $INSTALL_DIR/data/keys/total_keys.txt${NC}"
 echo -e "  2. 检查余额: ${GREEN}$INSTALL_DIR/scripts/check.sh${NC}"
@@ -242,4 +282,5 @@ echo -e "  停止: ${GREEN}$INSTALL_DIR/scripts/stop.sh${NC}"
 echo -e "  重启: ${GREEN}$INSTALL_DIR/scripts/restart.sh${NC}"
 echo -e "  状态: ${GREEN}$INSTALL_DIR/scripts/status.sh${NC}"
 echo -e "  日志: ${GREEN}$INSTALL_DIR/scripts/logs.sh${NC}"
+echo -e "  手动执行每日任务: ${GREEN}$INSTALL_DIR/scripts/daily.sh${NC}"
 echo ""
