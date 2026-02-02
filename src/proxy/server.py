@@ -30,21 +30,31 @@ COOLDOWN_FILE = os.getenv("COOLDOWN_FILE", "data/keys/cooldown_keys.json")
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 PORT = int(os.getenv("PORT", "3001"))
 
-# 参数转换默认启用
-ENABLE_PARAMS_CONVERSION = os.getenv("ENABLE_PARAMS_CONVERSION", "true").lower() == "true"
+# 参数处理配置
+# - 默认透传模式：直接转发请求，不做参数修改（适合 Cherry Studio 等已正确处理参数的客户端）
+# - 转换模式：对请求参数进行转换（适合其他客户端）
+ENABLE_PARAMS_CONVERSION = os.getenv("ENABLE_PARAMS_CONVERSION", "false").lower() == "true"
+
+# 模型 ID 标准化（可选）
+# 开启后会将简写模型名转换为完整格式，如 claude-sonnet-4 -> anthropic/claude-sonnet-4-20250514
+NORMALIZE_MODEL_ID = os.getenv("NORMALIZE_MODEL_ID", "false").lower() == "true"
 
 # 模型列表缓存配置
 MODELS_CACHE_TTL = int(os.getenv("MODELS_CACHE_TTL", "3600"))  # 默认1小时
 
 # ============== 参数转换模块（可选加载） ==============
 params_converter = None
+model_normalizer = None
+
 try:
     from .params import ParamsConverter
     params_converter = ParamsConverter()
+    model_normalizer = params_converter.normalize_model_id
 except ImportError:
     try:
         from src.proxy.params import ParamsConverter
         params_converter = ParamsConverter()
+        model_normalizer = params_converter.normalize_model_id
     except ImportError:
         pass
 
@@ -217,6 +227,47 @@ async def get_models_list(force_refresh: bool = False) -> Dict[str, Any]:
     return {"object": "list", "data": []}
 
 # ============== 请求处理 ==============
+def process_request_body(body: bytes) -> bytes:
+    """
+    处理请求体
+    
+    根据配置决定是否进行参数转换：
+    - 透传模式（默认）：只做最小必要的处理
+    - 转换模式：完整的参数转换
+    """
+    if not body:
+        return body
+    
+    try:
+        body_json = json.loads(body)
+    except json.JSONDecodeError:
+        return body
+    
+    modified = False
+    
+    # 1. 模型 ID 标准化（可选）
+    if NORMALIZE_MODEL_ID and model_normalizer:
+        model_id = body_json.get("model", "")
+        if model_id:
+            normalized = model_normalizer(model_id)
+            if normalized != model_id:
+                body_json["model"] = normalized
+                modified = True
+                log("debug", f"模型 ID 标准化: {model_id} -> {normalized}")
+    
+    # 2. 参数转换（可选）
+    if ENABLE_PARAMS_CONVERSION and params_converter:
+        try:
+            body_json = params_converter.convert_for_vercel_gateway(body_json)
+            modified = True
+        except Exception as e:
+            log("warn", f"参数转换失败: {e}")
+    
+    if modified:
+        return json.dumps(body_json).encode()
+    
+    return body
+
 async def proxy_request(request: Request, path: str) -> StreamingResponse:
     """代理请求到 Vercel AI Gateway"""
     
@@ -225,19 +276,9 @@ async def proxy_request(request: Request, path: str) -> StreamingResponse:
     if not api_key:
         raise HTTPException(status_code=503, detail="No available API keys")
     
-    # 读取请求体
+    # 读取并处理请求体
     body = await request.body()
-    
-    # 参数转换（如果启用）
-    if ENABLE_PARAMS_CONVERSION and params_converter and body:
-        try:
-            body_json = json.loads(body)
-            body_json = params_converter.convert(body_json)
-            body = json.dumps(body_json).encode()
-        except json.JSONDecodeError:
-            pass
-        except Exception as e:
-            log("warn", f"参数转换失败: {e}")
+    body = process_request_body(body)
     
     # 构建目标 URL
     target_url = f"{VERCEL_GATEWAY_URL}/{path}"
@@ -285,14 +326,24 @@ async def lifespan(app: FastAPI):
     api_keys = load_keys()
     cooldown_keys = load_cooldown_keys()
     
-    log("info", "Vercel Gateway Proxy - v3.1.0 (Python/FastAPI)")
+    # 确定当前模式
+    if ENABLE_PARAMS_CONVERSION:
+        mode = "参数转换模式"
+    elif NORMALIZE_MODEL_ID:
+        mode = "透传模式 + 模型ID标准化"
+    else:
+        mode = "透传模式"
+    
+    log("info", "Vercel Gateway Proxy - v3.2.0 (Python/FastAPI)")
     log("info", "=" * 60)
     log("info", f"监听端口: {PORT}")
     log("info", f"已加载密钥: {len(api_keys)} 个")
     log("info", f"冷却时间: {COOLDOWN_HOURS} 小时")
     log("info", f"认证密钥: {AUTH_KEY[:4]}****" if AUTH_KEY else "认证密钥: 未设置")
-    log("info", f"参数转换: {'启用' if ENABLE_PARAMS_CONVERSION and params_converter else '禁用'}")
+    log("info", f"工作模式: {mode}")
     log("info", f"模型缓存: {MODELS_CACHE_TTL} 秒")
+    log("info", "=" * 60)
+    log("info", "提示: Cherry Studio 用户建议使用默认透传模式")
     log("info", "=" * 60)
     
     # 定时重新加载密钥
@@ -311,7 +362,7 @@ async def lifespan(app: FastAPI):
 # ============== FastAPI 应用 ==============
 app = FastAPI(
     title="Vercel Gateway Proxy",
-    version="3.1.0",
+    version="3.2.0",
     lifespan=lifespan
 )
 
@@ -321,9 +372,10 @@ async def root():
     return {
         "status": "ok",
         "service": "vercel-gateway-proxy",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "keys_loaded": len(api_keys),
-        "keys_in_cooldown": len(cooldown_keys)
+        "keys_in_cooldown": len(cooldown_keys),
+        "mode": "passthrough" if not ENABLE_PARAMS_CONVERSION else "conversion"
     }
 
 @app.get("/health")
