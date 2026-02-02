@@ -29,7 +29,9 @@ KEYS_FILE = os.getenv("KEYS_FILE", "data/keys/keys_high.txt")
 COOLDOWN_FILE = os.getenv("COOLDOWN_FILE", "data/keys/cooldown_keys.json")
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 PORT = int(os.getenv("PORT", "3001"))
-ENABLE_PARAMS_CONVERSION = os.getenv("ENABLE_PARAMS_CONVERSION", "false").lower() == "true"
+
+# 参数转换默认启用
+ENABLE_PARAMS_CONVERSION = os.getenv("ENABLE_PARAMS_CONVERSION", "true").lower() == "true"
 
 # 模型列表缓存配置
 MODELS_CACHE_TTL = int(os.getenv("MODELS_CACHE_TTL", "3600"))  # 默认1小时
