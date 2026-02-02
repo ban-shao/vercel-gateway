@@ -1,6 +1,6 @@
 # Vercel Gateway
 
-Vercel AI Gateway 密钥池管理与代理服务 - 配合 NewAPI 使用
+Vercel AI Gateway 密钥池管理与代理服务 - 配合 NewAPI / Cherry Studio 使用
 
 ## 📋 功能特性
 
@@ -11,15 +11,67 @@ Vercel AI Gateway 密钥池管理与代理服务 - 配合 NewAPI 使用
 - ✅ **高余额优先** - 自动使用 $3+ 高余额密钥
 - ✅ **流式响应** - 完整支持 SSE 流式输出
 - ✅ **systemd 服务** - 开机自启、崩溃自动重启
+- ✅ **Cherry Studio 参数转换** - 自动处理 providerOptions 参数
+- ✅ **模型列表 API** - 兼容 OpenAI /v1/models 端点
 
 ## 🏗️ 架构
 
 ```
-客户端 → NewAPI → vercel-gateway (本项目) → ai-gateway.vercel.sh
-                        ↑
-                   密钥池轮换
-                   故障转移
-                   流式代理
+客户端 → NewAPI/Cherry Studio → vercel-gateway (本项目) → ai-gateway.vercel.sh
+                                        ↑
+                                   密钥池轮换
+                                   参数转换
+                                   故障转移
+                                   流式代理
+```
+
+## 🎯 Cherry Studio 参数转换
+
+本项目支持自动转换 Cherry Studio 发送的参数格式，让各种模型的特殊参数（如思考强度）能够正确传递到 Vercel AI Gateway。
+
+### 支持的参数类型
+
+| Provider | 参数格式 | 说明 |
+|----------|----------|------|
+| **Anthropic/Claude** | `thinking: { type, budgetTokens }` | Claude 4.x 思考模式 |
+| **OpenAI** | `reasoningEffort: low/medium/high` | o1/o3/o4 推理强度 |
+| **Google/Gemini** | `thinkingConfig: { thinkingBudget, includeThoughts }` | Gemini 2.5 思考配置 |
+| **XAI/Grok** | `reasoningEffort: low/high` | Grok 推理强度 |
+| **DeepSeek** | `thinking: { type }` 或 `enable_thinking` | DeepSeek R1 |
+| **Qwen** | `enable_thinking, thinking_budget` | QwQ/Qwen3 |
+
+### 参数转换示例
+
+**Cherry Studio 发送的请求：**
+```json
+{
+  "model": "claude-sonnet-4",
+  "messages": [...],
+  "providerOptions": {
+    "anthropic": {
+      "thinking": {
+        "type": "enabled",
+        "budgetTokens": 8192
+      }
+    }
+  }
+}
+```
+
+**转换后发送到 Vercel AI Gateway：**
+```json
+{
+  "model": "anthropic/claude-sonnet-4-20250514",
+  "messages": [...],
+  "providerOptions": {
+    "anthropic": {
+      "thinking": {
+        "type": "enabled",
+        "budget_tokens": 8192
+      }
+    }
+  }
+}
 ```
 
 ## ⏰ 每日定时任务
@@ -68,7 +120,12 @@ Vercel AI Gateway 密钥池管理与代理服务 - 配合 NewAPI 使用
 ├── requirements.txt              # Python 依赖
 ├── src/
 │   ├── proxy/
-│   │   └── server.py             # FastAPI 代理服务
+│   │   ├── server.py             # FastAPI 代理服务
+│   │   └── params/               # 参数转换模块
+│   │       ├── __init__.py
+│   │       ├── converter.py      # 核心转换逻辑
+│   │       ├── models.py         # 模型配置
+│   │       └── reasoning.py      # 推理参数处理
 │   ├── checker/
 │   │   └── billing_checker.py    # 余额检查工具
 │   ├── refresher/
@@ -143,6 +200,9 @@ KEY_COOLDOWN_HOURS=24
 
 # 日志级别
 LOG_LEVEL=info
+
+# 是否启用参数转换（默认启用）
+ENABLE_PARAMS_CONVERSION=true
 ```
 
 ## 📡 API 端点
@@ -150,10 +210,47 @@ LOG_LEVEL=info
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/health` | GET | 健康检查 |
+| `/v1/models` | GET | 获取支持的模型列表 |
+| `/v1/models/{model_id}` | GET | 获取单个模型信息 |
 | `/admin/status` | GET | 查看密钥状态 |
 | `/admin/reset` | POST | 重置所有密钥 |
 | `/admin/reload` | POST | 重新加载密钥文件 |
 | `/v1/*` | ALL | 代理到 Vercel |
+
+### 模型列表 API
+
+```bash
+# 获取所有模型
+curl -H "Authorization: Bearer YOUR_AUTH_KEY" \
+  http://127.0.0.1:3001/v1/models
+
+# 按 Provider 过滤
+curl -H "Authorization: Bearer YOUR_AUTH_KEY" \
+  "http://127.0.0.1:3001/v1/models?provider=anthropic"
+```
+
+返回格式（OpenAI 兼容）：
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "anthropic/claude-sonnet-4-20250514",
+      "object": "model",
+      "created": 1700000000,
+      "owned_by": "anthropic",
+      "_extra": {
+        "name": "Claude Sonnet 4",
+        "capabilities": {
+          "thinking": true,
+          "vision": true,
+          "tools": true
+        }
+      }
+    }
+  ]
+}
+```
 
 ## 🔗 NewAPI 渠道配置
 
@@ -163,6 +260,41 @@ LOG_LEVEL=info
 | Base URL | `http://127.0.0.1:3001` |
 | API Key | `.env` 中的 `AUTH_KEY` |
 | 模型 | `claude-sonnet-4`, `claude-3.5-sonnet` 等 |
+
+## 🍒 Cherry Studio 配置
+
+| 配置项 | 值 |
+|--------|-----|
+| API 地址 | `http://127.0.0.1:3001/v1/ai#` |
+| API 密钥 | `.env` 中的 `AUTH_KEY` |
+| 模型 | 从模型列表中选择或手动添加 |
+
+### 支持的模型
+
+**Anthropic:**
+- `claude-sonnet-4` / `anthropic/claude-sonnet-4-20250514`
+- `claude-opus-4` / `anthropic/claude-opus-4-20250514`
+- `claude-3.5-sonnet` / `anthropic/claude-3-5-sonnet-20241022`
+- `claude-3.5-haiku` / `anthropic/claude-3-5-haiku-20241022`
+
+**OpenAI:**
+- `gpt-4o` / `openai/gpt-4o`
+- `gpt-4o-mini` / `openai/gpt-4o-mini`
+- `o1` / `openai/o1`
+- `o3` / `openai/o3`
+- `o4-mini` / `openai/o4-mini`
+
+**Google:**
+- `gemini-2.5-pro` / `google/gemini-2.5-pro-preview-06-05`
+- `gemini-2.5-flash` / `google/gemini-2.5-flash-preview-05-20`
+
+**XAI:**
+- `grok-3` / `xai/grok-3`
+- `grok-3-mini` / `xai/grok-3-mini`
+
+**DeepSeek:**
+- `deepseek-r1` / `deepseek/deepseek-r1`
+- `deepseek-chat` / `deepseek/deepseek-chat`
 
 ## 📊 常用命令
 
