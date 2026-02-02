@@ -1,0 +1,32 @@
+{
+  "name": "vercel-gateway-ts",
+  "version": "4.0.0",
+  "description": "Vercel AI Gateway 代理服务 - 使用官方 AI SDK 实现参数转换",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "start:ts": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^1.2.0",
+    "@ai-sdk/google": "^1.2.0",
+    "@ai-sdk/openai": "^1.2.0",
+    "@ai-sdk/xai": "^1.2.0",
+    "ai": "^4.3.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "winston": "^3.14.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
