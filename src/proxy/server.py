@@ -7,6 +7,7 @@ Vercel Gateway Proxy - FastAPI 版本
 
 import os
 import re
+import sys
 import time
 import json
 import asyncio
@@ -20,21 +21,6 @@ from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-
-# 导入参数转换模块
-try:
-    from .params import (
-        ParamsConverter,
-        get_model_info,
-        get_all_models,
-        get_models_by_provider,
-        detect_provider,
-        ProviderType,
-        SUPPORTED_MODELS,
-    )
-    PARAMS_MODULE_AVAILABLE = True
-except ImportError:
-    PARAMS_MODULE_AVAILABLE = False
 
 # ================================
 # 配置加载
@@ -65,13 +51,92 @@ def log(level: str, message: str):
 
 
 # ================================
-# 参数转换器
+# 导入参数转换模块（多种方式尝试）
 # ================================
 
+PARAMS_MODULE_AVAILABLE = False
+params_converter = None
+SUPPORTED_MODELS = {}
+
+# 尝试多种导入方式
+def try_import_params():
+    global PARAMS_MODULE_AVAILABLE, params_converter, SUPPORTED_MODELS
+    
+    # 方式1: 相对导入
+    try:
+        from .params import (
+            ParamsConverter,
+            get_model_info,
+            get_all_models,
+            get_models_by_provider,
+            detect_provider,
+            ProviderType,
+            SUPPORTED_MODELS as SM,
+        )
+        PARAMS_MODULE_AVAILABLE = True
+        params_converter = ParamsConverter()
+        SUPPORTED_MODELS = SM
+        log("info", f"参数模块加载成功 (相对导入)，支持 {len(SUPPORTED_MODELS)} 个模型")
+        return True
+    except ImportError as e:
+        log("debug", f"相对导入失败: {e}")
+    
+    # 方式2: 绝对导入
+    try:
+        from src.proxy.params import (
+            ParamsConverter,
+            get_model_info,
+            get_all_models,
+            get_models_by_provider,
+            detect_provider,
+            ProviderType,
+            SUPPORTED_MODELS as SM,
+        )
+        PARAMS_MODULE_AVAILABLE = True
+        params_converter = ParamsConverter()
+        SUPPORTED_MODELS = SM
+        log("info", f"参数模块加载成功 (绝对导入)，支持 {len(SUPPORTED_MODELS)} 个模型")
+        return True
+    except ImportError as e:
+        log("debug", f"绝对导入失败: {e}")
+    
+    # 方式3: 添加路径后导入
+    try:
+        params_dir = Path(__file__).resolve().parent
+        if str(params_dir) not in sys.path:
+            sys.path.insert(0, str(params_dir))
+        
+        from params import (
+            ParamsConverter,
+            get_model_info,
+            get_all_models,
+            get_models_by_provider,
+            detect_provider,
+            ProviderType,
+            SUPPORTED_MODELS as SM,
+        )
+        PARAMS_MODULE_AVAILABLE = True
+        params_converter = ParamsConverter()
+        SUPPORTED_MODELS = SM
+        log("info", f"参数模块加载成功 (路径导入)，支持 {len(SUPPORTED_MODELS)} 个模型")
+        return True
+    except ImportError as e:
+        log("warn", f"参数模块导入失败: {e}")
+    
+    return False
+
+# 执行导入
+try_import_params()
+
+# 重新定义函数（如果导入失败则使用占位函数）
 if PARAMS_MODULE_AVAILABLE:
-    params_converter = ParamsConverter()
-else:
-    params_converter = None
+    try:
+        from .params import get_model_info, get_all_models, get_models_by_provider, detect_provider, ProviderType
+    except ImportError:
+        try:
+            from src.proxy.params import get_model_info, get_all_models, get_models_by_provider, detect_provider, ProviderType
+        except ImportError:
+            from params import get_model_info, get_all_models, get_models_by_provider, detect_provider, ProviderType
 
 
 # ================================
@@ -329,6 +394,8 @@ async def lifespan(app: FastAPI):
     log("info", f"参数转换: {'启用' if ENABLE_PARAMS_CONVERSION and PARAMS_MODULE_AVAILABLE else '禁用'}")
     if PARAMS_MODULE_AVAILABLE:
         log("info", f"支持模型: {len(SUPPORTED_MODELS)} 个")
+    else:
+        log("warn", "参数模块未加载，使用基本模型列表")
     log("info", "=" * 60)
     
     if not key_manager.keys:
@@ -398,6 +465,39 @@ async def health():
 # 路由 - 模型列表 (OpenAI 兼容)
 # ================================
 
+# 基础模型列表（当参数模块不可用时使用）
+BASIC_MODELS = [
+    # Anthropic / Claude
+    {"id": "anthropic/claude-sonnet-4-20250514", "object": "model", "owned_by": "anthropic"},
+    {"id": "anthropic/claude-opus-4-20250514", "object": "model", "owned_by": "anthropic"},
+    {"id": "anthropic/claude-3-5-sonnet-20241022", "object": "model", "owned_by": "anthropic"},
+    {"id": "anthropic/claude-3-5-haiku-20241022", "object": "model", "owned_by": "anthropic"},
+    {"id": "anthropic/claude-3-opus-20240229", "object": "model", "owned_by": "anthropic"},
+    # OpenAI
+    {"id": "openai/gpt-4o", "object": "model", "owned_by": "openai"},
+    {"id": "openai/gpt-4o-mini", "object": "model", "owned_by": "openai"},
+    {"id": "openai/gpt-4-turbo", "object": "model", "owned_by": "openai"},
+    {"id": "openai/o1", "object": "model", "owned_by": "openai"},
+    {"id": "openai/o1-mini", "object": "model", "owned_by": "openai"},
+    {"id": "openai/o1-pro", "object": "model", "owned_by": "openai"},
+    {"id": "openai/o3", "object": "model", "owned_by": "openai"},
+    {"id": "openai/o3-mini", "object": "model", "owned_by": "openai"},
+    {"id": "openai/o4-mini", "object": "model", "owned_by": "openai"},
+    # Google / Gemini
+    {"id": "google/gemini-2.5-pro-preview-06-05", "object": "model", "owned_by": "google"},
+    {"id": "google/gemini-2.5-flash-preview-05-20", "object": "model", "owned_by": "google"},
+    {"id": "google/gemini-2.0-flash", "object": "model", "owned_by": "google"},
+    {"id": "google/gemini-1.5-pro", "object": "model", "owned_by": "google"},
+    # XAI / Grok
+    {"id": "xai/grok-3", "object": "model", "owned_by": "xai"},
+    {"id": "xai/grok-3-mini", "object": "model", "owned_by": "xai"},
+    {"id": "xai/grok-2", "object": "model", "owned_by": "xai"},
+    # DeepSeek
+    {"id": "deepseek/deepseek-r1", "object": "model", "owned_by": "deepseek"},
+    {"id": "deepseek/deepseek-chat", "object": "model", "owned_by": "deepseek"},
+]
+
+
 @app.get("/v1/models")
 async def list_models(
     request: Request,
@@ -414,16 +514,10 @@ async def list_models(
     
     if not PARAMS_MODULE_AVAILABLE:
         # 降级：返回基本模型列表
-        return {
-            "object": "list",
-            "data": [
-                {"id": "anthropic/claude-sonnet-4-20250514", "object": "model", "owned_by": "anthropic"},
-                {"id": "anthropic/claude-3-5-sonnet-20241022", "object": "model", "owned_by": "anthropic"},
-                {"id": "openai/gpt-4o", "object": "model", "owned_by": "openai"},
-                {"id": "openai/o1", "object": "model", "owned_by": "openai"},
-                {"id": "google/gemini-2.5-pro-preview-06-05", "object": "model", "owned_by": "google"},
-            ]
-        }
+        models = BASIC_MODELS
+        if provider:
+            models = [m for m in models if m["owned_by"] == provider.lower()]
+        return {"object": "list", "data": models}
     
     # 获取模型列表
     if provider:
@@ -452,6 +546,10 @@ async def get_model(request: Request, model_id: str):
         raise HTTPException(status_code=401, detail="Unauthorized")
     
     if not PARAMS_MODULE_AVAILABLE:
+        # 降级：从基本模型列表中查找
+        for m in BASIC_MODELS:
+            if m["id"] == model_id or m["id"].endswith(f"/{model_id}"):
+                return m
         raise HTTPException(status_code=404, detail="Model not found")
     
     model_info = get_model_info(model_id)
