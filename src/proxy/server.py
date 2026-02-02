@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Vercel Gateway Proxy - FastAPI 版本
-支持流式响应、密钥轮换、自动故障转移
+支持流式响应、密钥轮换、自动故障转移、Cherry Studio 参数转换
 """
 
 import os
@@ -11,15 +11,30 @@ import time
 import json
 import asyncio
 from pathlib import Path
-from typing import Optional, AsyncGenerator
+from typing import Optional, AsyncGenerator, Dict, Any, List
 from datetime import datetime
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+
+# 导入参数转换模块
+try:
+    from .params import (
+        ParamsConverter,
+        get_model_info,
+        get_all_models,
+        get_models_by_provider,
+        detect_provider,
+        ProviderType,
+        SUPPORTED_MODELS,
+    )
+    PARAMS_MODULE_AVAILABLE = True
+except ImportError:
+    PARAMS_MODULE_AVAILABLE = False
 
 # ================================
 # 配置加载
@@ -33,6 +48,8 @@ AUTH_KEY = os.getenv("AUTH_KEY", "changeme")
 KEY_COOLDOWN_HOURS = int(os.getenv("KEY_COOLDOWN_HOURS", "24"))
 KEY_COOLDOWN_SECONDS = KEY_COOLDOWN_HOURS * 3600
 LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
+# 是否启用参数转换（默认启用）
+ENABLE_PARAMS_CONVERSION = os.getenv("ENABLE_PARAMS_CONVERSION", "true").lower() == "true"
 
 TARGET_HOST = "ai-gateway.vercel.sh"
 TARGET_BASE = f"https://{TARGET_HOST}"
@@ -45,6 +62,16 @@ def log(level: str, message: str):
     """简单日志输出"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] [{level.upper()}] {message}", flush=True)
+
+
+# ================================
+# 参数转换器
+# ================================
+
+if PARAMS_MODULE_AVAILABLE:
+    params_converter = ParamsConverter()
+else:
+    params_converter = None
 
 
 # ================================
@@ -227,11 +254,53 @@ def normalize_model(model: str) -> str:
     """标准化模型名称"""
     if not model:
         return model
+    
+    # 如果参数转换模块可用，使用更智能的转换
+    if PARAMS_MODULE_AVAILABLE and params_converter:
+        return params_converter.normalize_model_id(model)
+    
+    # 降级到简单转换
     if model.startswith("anthropic/"):
         return model
     if model.startswith("claude-"):
         return f"anthropic/{model}"
     return model
+
+
+def convert_request_body(body: Dict[str, Any]) -> Dict[str, Any]:
+    """转换请求体参数"""
+    if not ENABLE_PARAMS_CONVERSION:
+        return body
+    
+    if not PARAMS_MODULE_AVAILABLE or not params_converter:
+        # 降级：只做基本的模型标准化
+        if "model" in body:
+            body["model"] = normalize_model(body["model"])
+        return body
+    
+    try:
+        converted = params_converter.convert_for_vercel_gateway(body)
+        
+        # 记录转换日志
+        original_model = body.get("model", "")
+        converted_model = converted.get("model", "")
+        if original_model != converted_model:
+            log("info", f"模型标准化: {original_model} -> {converted_model}")
+        
+        # 记录参数转换
+        if "providerOptions" in converted:
+            provider_opts = converted["providerOptions"]
+            for provider, opts in provider_opts.items():
+                if opts:
+                    log("debug", f"Provider 选项 [{provider}]: {json.dumps(opts, ensure_ascii=False)[:200]}")
+        
+        return converted
+    except Exception as e:
+        log("error", f"参数转换失败: {e}")
+        # 降级到原始请求
+        if "model" in body:
+            body["model"] = normalize_model(body["model"])
+        return body
 
 
 def check_auth(request: Request) -> bool:
@@ -251,12 +320,15 @@ async def lifespan(app: FastAPI):
     global http_client
     
     log("info", "=" * 60)
-    log("info", "Vercel Gateway Proxy - v2.1.0 (Python/FastAPI)")
+    log("info", "Vercel Gateway Proxy - v3.0.0 (Python/FastAPI)")
     log("info", "=" * 60)
     log("info", f"监听端口: {PROXY_PORT}")
     log("info", f"已加载密钥: {len(key_manager.keys)} 个")
     log("info", f"冷却时间: {KEY_COOLDOWN_HOURS} 小时")
     log("info", f"认证密钥: {AUTH_KEY[:4]}****")
+    log("info", f"参数转换: {'启用' if ENABLE_PARAMS_CONVERSION and PARAMS_MODULE_AVAILABLE else '禁用'}")
+    if PARAMS_MODULE_AVAILABLE:
+        log("info", f"支持模型: {len(SUPPORTED_MODELS)} 个")
     log("info", "=" * 60)
     
     if not key_manager.keys:
@@ -282,8 +354,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Vercel Gateway Proxy",
-    description="Vercel AI Gateway 密钥池代理服务",
-    version="2.1.0",
+    description="Vercel AI Gateway 密钥池代理服务 - 支持 Cherry Studio 参数格式",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -309,13 +381,89 @@ async def health():
     return {
         "ok": True,
         "service": "Vercel Gateway Proxy",
-        "version": "2.1.0",
+        "version": "3.0.0",
+        "features": {
+            "params_conversion": ENABLE_PARAMS_CONVERSION and PARAMS_MODULE_AVAILABLE,
+            "supported_models": len(SUPPORTED_MODELS) if PARAMS_MODULE_AVAILABLE else 0,
+        },
         "keys": {
             "total": status["total"],
             "available": status["available"]
         },
         "timestamp": datetime.now().isoformat()
     }
+
+
+# ================================
+# 路由 - 模型列表 (OpenAI 兼容)
+# ================================
+
+@app.get("/v1/models")
+async def list_models(
+    request: Request,
+    provider: Optional[str] = Query(None, description="按 Provider 过滤 (anthropic, openai, google, xai, deepseek)")
+):
+    """
+    获取支持的模型列表
+    
+    兼容 OpenAI /v1/models 端点格式
+    支持按 provider 过滤
+    """
+    if not check_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    if not PARAMS_MODULE_AVAILABLE:
+        # 降级：返回基本模型列表
+        return {
+            "object": "list",
+            "data": [
+                {"id": "anthropic/claude-sonnet-4-20250514", "object": "model", "owned_by": "anthropic"},
+                {"id": "anthropic/claude-3-5-sonnet-20241022", "object": "model", "owned_by": "anthropic"},
+                {"id": "openai/gpt-4o", "object": "model", "owned_by": "openai"},
+                {"id": "openai/o1", "object": "model", "owned_by": "openai"},
+                {"id": "google/gemini-2.5-pro-preview-06-05", "object": "model", "owned_by": "google"},
+            ]
+        }
+    
+    # 获取模型列表
+    if provider:
+        try:
+            provider_type = ProviderType(provider.lower())
+            models = get_models_by_provider(provider_type)
+        except ValueError:
+            models = get_all_models()
+    else:
+        models = get_all_models()
+    
+    return {
+        "object": "list",
+        "data": models
+    }
+
+
+@app.get("/v1/models/{model_id:path}")
+async def get_model(request: Request, model_id: str):
+    """
+    获取单个模型信息
+    
+    兼容 OpenAI /v1/models/{model} 端点格式
+    """
+    if not check_auth(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    if not PARAMS_MODULE_AVAILABLE:
+        raise HTTPException(status_code=404, detail="Model not found")
+    
+    model_info = get_model_info(model_id)
+    if not model_info:
+        # 尝试标准化后再查找
+        normalized = normalize_model(model_id)
+        model_info = get_model_info(normalized)
+    
+    if not model_info:
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+    
+    return model_info.to_openai_format()
 
 
 # ================================
@@ -435,12 +583,10 @@ async def proxy(request: Request, path: str):
     if body:
         try:
             body_json = json.loads(body)
-            # 标准化模型名称
-            if "model" in body_json:
-                original_model = body_json["model"]
-                body_json["model"] = normalize_model(original_model)
-                if original_model != body_json["model"]:
-                    log("info", f"模型标准化: {original_model} -> {body_json['model']}")
+            
+            # 使用参数转换器处理请求体
+            body_json = convert_request_body(body_json)
+            
             # 检查是否为流式请求
             is_stream = body_json.get("stream", False)
         except json.JSONDecodeError:
